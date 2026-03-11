@@ -3,15 +3,18 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:flutter_appauth/flutter_appauth.dart';
+import 'firebase_options.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
-  //runApp(const MyApp());
-  runApp(const Directionality(
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+  runApp(const MyApp());
+  /*runApp(const Directionality(
   textDirection: TextDirection.ltr,
   child: Center(child: Text('Hello')),
-));
+));*/
 }
 
 class MyApp extends StatelessWidget {
@@ -135,8 +138,7 @@ class LoginPage extends StatelessWidget {
                 child: const Text('Continue with Google'),
               ),
             ),
-            //Github oAuth client ID: Ov23lil2hL15i2xj0BDW
-            //Github oAuth secret: 45a1cb488dc09d5f22bb9c99c2dfb6b059e3aba2
+            //Github oAuth client ID: Ov23lil2hL15i2xj0BD
             const SizedBox(height: 12),
             SizedBox(
               width: double.infinity,
