@@ -388,8 +388,38 @@ class DiaryEntry {
   }
 }
 
-class AuthOptionsPage extends StatelessWidget {
+class AuthOptionsPage extends StatefulWidget {
   const AuthOptionsPage({super.key});
+
+  @override
+  State<AuthOptionsPage> createState() => _AuthOptionsPageState();
+}
+
+class _AuthOptionsPageState extends State<AuthOptionsPage>
+    with WidgetsBindingObserver {
+  bool _isResumed = true;
+  bool _needsLink = false;
+  bool _isLinking = false;
+  String? _pendingGithubAccessToken;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _isResumed =
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _isResumed = state == AppLifecycleState.resumed;
+  }
 
   Future<void> _signInWithGoogle(BuildContext context) async {
     if (FirebaseAuth.instance.currentUser != null) {
@@ -411,14 +441,63 @@ class AuthOptionsPage extends StatelessWidget {
         idToken: googleAuth.idToken,
       );
 
-      await FirebaseAuth.instance.signInWithCredential(credential);
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        await user.linkWithCredential(credential);
+      } else {
+        await FirebaseAuth.instance.signInWithCredential(credential);
+      }
+
+      if (_needsLink && _pendingGithubAccessToken != null) {
+        final githubCredential =
+            GithubAuthProvider.credential(_pendingGithubAccessToken!);
+        await FirebaseAuth.instance.currentUser
+            ?.linkWithCredential(githubCredential);
+        if (mounted) {
+          setState(() {
+            _needsLink = false;
+            _pendingGithubAccessToken = null;
+          });
+        }
+      }
+
       if (context.mounted) {
         Navigator.of(context).pushAndRemoveUntil(
           MaterialPageRoute(builder: (_) => const DiaryPage()),
           (route) => false,
         );
       }
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'account-exists-with-different-credential') {
+        final email = e.email;
+        if (email == null) return;
 
+        final methods =
+            await FirebaseAuth.instance.fetchSignInMethodsForEmail(email);
+
+        if (methods.contains('google.com')) {
+          // Sign in with Google to get the existing user
+          final googleUser = await GoogleSignIn().signIn();
+          if (googleUser == null) return;
+
+          final googleAuth = await googleUser.authentication;
+          final googleCredential = GoogleAuthProvider.credential(
+            accessToken: googleAuth.accessToken,
+            idToken: googleAuth.idToken,
+          );
+
+          await FirebaseAuth.instance.signInWithCredential(googleCredential);
+          // No need to link; we are already using Google for this account
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Please sign in with your other provider.')),
+          );
+        }
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Google sign-in failed: ${e.message}')),
+        );
+      }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Google sign-in failed: $e')),
@@ -426,18 +505,9 @@ class AuthOptionsPage extends StatelessWidget {
     }
   }
 
-  Future<void> _signInWithGitHubDeviceFlow(BuildContext context) async {
-  const clientId = 'Ov23lil2hL15i2xj0BDW';
-  if (FirebaseAuth.instance.currentUser != null) {
-    if (context.mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(builder: (_) => const DiaryPage()),
-      );
-    }
-    return;
-  }
+  Future<String?> _getGitHubAccessToken(BuildContext context) async {
+    const clientId = 'Ov23lil2hL15i2xj0BDW';
 
-  try {
     final deviceCodeRes = await http.post(
       Uri.parse('https://github.com/login/device/code'),
       headers: {'Accept': 'application/json'},
@@ -461,8 +531,10 @@ class AuthOptionsPage extends StatelessWidget {
             children: [
               Text('Go to: $verificationUri'),
               const SizedBox(height: 8),
-              Text('Code: $userCode',
-                  style: const TextStyle(fontWeight: FontWeight.bold)),
+              Text(
+                'Code: $userCode',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
             ],
           ),
           actions: [
@@ -482,17 +554,7 @@ class AuthOptionsPage extends StatelessWidget {
               child: const Text('Open link'),
             ),
             TextButton(
-              onPressed: () {
-                final user = FirebaseAuth.instance.currentUser;
-                if (user != null) {
-                  Navigator.of(context).pushAndRemoveUntil(
-                    MaterialPageRoute(builder: (_) => const DiaryPage()),
-                    (route) => false,
-                  );
-                } else {
-                  Navigator.pop(context);
-                }
-              },
+              onPressed: () => Navigator.pop(context),
               child: const Text('Done'),
             ),
           ],
@@ -500,8 +562,10 @@ class AuthOptionsPage extends StatelessWidget {
       },
     );
 
-    // Poll for token
     while (true) {
+      while (!_isResumed) {
+        await Future.delayed(const Duration(milliseconds: 500));
+      }
       await Future.delayed(Duration(seconds: interval));
 
       final tokenRes = await http.post(
@@ -517,13 +581,7 @@ class AuthOptionsPage extends StatelessWidget {
       final tokenData = jsonDecode(tokenRes.body) as Map<String, dynamic>;
 
       if (tokenData['access_token'] != null) {
-        final accessToken = tokenData['access_token'] as String;
-        final credential = GithubAuthProvider.credential(accessToken);
-        await FirebaseAuth.instance.signInWithCredential(credential);
-        if (context.mounted) {
-          Navigator.of(context, rootNavigator: true).pop();
-        }
-        break;
+        return tokenData['access_token'] as String;
       }
 
       final error = tokenData['error'] as String?;
@@ -534,12 +592,53 @@ class AuthOptionsPage extends StatelessWidget {
       }
       throw Exception('GitHub device flow failed: $error');
     }
-  } catch (e) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('GitHub sign‑in failed: $e')),
-    );
   }
-}
+
+  Future<void> _signInWithGitHubDeviceFlow(BuildContext context) async {
+    try {
+      final accessToken = await _getGitHubAccessToken(context);
+      if (accessToken == null) return;
+
+      final credential = GithubAuthProvider.credential(accessToken);
+      try {
+        final user = FirebaseAuth.instance.currentUser;
+        if (user != null) {
+          await user.linkWithCredential(credential);
+        } else {
+          await FirebaseAuth.instance.signInWithCredential(credential);
+        }
+      } on FirebaseAuthException catch (e) {
+        if (e.code == 'account-exists-with-different-credential') {
+          if (mounted) {
+            setState(() {
+              _needsLink = true;
+              _pendingGithubAccessToken = accessToken;
+            });
+          }
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Please sign in with your other provider.'),
+            ),
+          );
+          return;
+        } else {
+          rethrow;
+        }
+      }
+
+      if (context.mounted) {
+        Navigator.of(context, rootNavigator: true).pop();
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const DiaryPage()),
+          (route) => false,
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('GitHub sign‑in failed: $e')),
+      );
+    }
+  }
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -549,6 +648,34 @@ class AuthOptionsPage extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
+            if (_needsLink)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Column(
+                  children: [
+                    const Text(
+                      'To continue, sign in with Google to link accounts.',
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: _isLinking
+                            ? null
+                            : () async {
+                                setState(() => _isLinking = true);
+                                await _signInWithGoogle(context);
+                                if (mounted) {
+                                  setState(() => _isLinking = false);
+                                }
+                              },
+                        child: const Text('Sign in with Google to link'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
@@ -566,14 +693,6 @@ class AuthOptionsPage extends StatelessWidget {
                 child: const Text('Continue with GitHub'),
               ),
             ),
-   /*         const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: OutlinedButton(
-                onPressed: () {},
-                child: const Text('Login'),
-              ),
-            ),*/
           ],
         ),
       ),
